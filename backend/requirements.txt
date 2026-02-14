@@ -1,4 +1,8 @@
-fastapi
-uvicorn[standard]
+fastapi[standard]
 httpx
-requests
+motor
+python-dotenv
+pymongo[srv]
+passlib[bcrypt]
+python-jose[cryptography]
+pydantic[email]
