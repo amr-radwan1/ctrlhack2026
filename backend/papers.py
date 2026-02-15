@@ -1,227 +1,155 @@
 import os
-from datetime import datetime, timezone
+import re
+import logging
 
-import httpx
-from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from google import genai
+from google.genai import types
+from fastapi import HTTPException
 
-from auth import get_current_user
-from database import get_db
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OPENAI_API_URL = "https://api.openai.com/v1/embeddings"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-EMBEDDING_MODEL = "text-embedding-3-small"  # 1536 dimensions
-EMBEDDING_DIMENSIONS = 1536
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSIONS = 768
+GROUNDING_MODEL = "gemini-2.5-flash-lite"
 
-# ---------------------------------------------------------------------------
-# Pydantic schemas
-# ---------------------------------------------------------------------------
-
-class SavePaperRequest(BaseModel):
-    arxiv_id: str
-    title: str
-    url: str
-    summary: str
-    authors: list[str] = []
-    published: str = ""
-
-
-class PaperOut(BaseModel):
-    id: str
-    arxiv_id: str
-    title: str
-    url: str
-    summary: str
-    authors: list[str]
-    published: str
-    similarity_score: float | None = None
+# Initialize Gemini client
+genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 # ---------------------------------------------------------------------------
-# Embedding helper
+# Embedding helpers
 # ---------------------------------------------------------------------------
 
 async def generate_embedding(text: str) -> list[float]:
-    """Generate an embedding vector for the given text using OpenAI."""
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    """Generate an embedding vector for the given text using Google Gemini."""
+    if not genai_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            OPENAI_API_URL,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": EMBEDDING_MODEL,
-                "input": text,
-                "dimensions": EMBEDDING_DIMENSIONS,
-            },
+    try:
+        result = genai_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=[text],
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIMENSIONS,
+            ),
         )
-    if response.status_code != 200:
+        return result.embeddings[0].values
+    except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail=f"OpenAI embedding request failed: {response.text}",
+            detail=f"Gemini embedding request failed: {str(e)}",
         )
-    data = response.json()
-    return data["data"][0]["embedding"]
+
+
+async def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Generate embedding vectors for multiple texts in a single Gemini API call."""
+    if not genai_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+    if not texts:
+        return []
+
+    try:
+        result = genai_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=texts
+        )
+        return [e.values for e in result.embeddings]
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini batch embedding request failed: {str(e)}",
+        )
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ---------------------------------------------------------------------------
-# Router
+# Google Search grounding – discover similar papers
 # ---------------------------------------------------------------------------
-router = APIRouter(prefix="/papers", tags=["papers"])
+
+_ARXIV_ID_RE = re.compile(r"\b(\d{4}\.\d{4,5})\b")
 
 
-@router.post("/save", response_model=PaperOut)
-async def save_paper(body: SavePaperRequest, current_user: dict = Depends(get_current_user)):
-    """Save a paper to the user's collection with a vector embedding of its summary."""
-    db = get_db()
-    user_id = str(current_user["_id"])
+async def find_similar_papers_via_search(
+    title: str,
+    summary: str,
+    max_results: int = 8,
+) -> list[dict]:
+    """Use Gemini with Google Search grounding to find related arXiv papers.
 
-    # Check if already saved
-    existing = await db.papers.find_one({"user_id": user_id, "arxiv_id": body.arxiv_id})
-    if existing:
-        return PaperOut(
-            id=str(existing["_id"]),
-            arxiv_id=existing["arxiv_id"],
-            title=existing["title"],
-            url=existing["url"],
-            summary=existing["summary"],
-            authors=existing.get("authors", []),
-            published=existing.get("published", ""),
-        )
+    Returns a list of dicts with keys: ``arxiv_id``, ``title``.
+    """
+    if not genai_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
 
-    # Generate embedding from the summary
-    embedding = await generate_embedding(body.summary)
+    # Truncate summary to keep the prompt focused
+    summary_excerpt = summary[:500] if summary else ""
 
-    paper_doc = {
-        "user_id": user_id,
-        "arxiv_id": body.arxiv_id,
-        "title": body.title,
-        "url": body.url,
-        "summary": body.summary,
-        "authors": body.authors,
-        "published": body.published,
-        "embedding": embedding,
-        "saved_at": datetime.now(timezone.utc),
-    }
-    result = await db.papers.insert_one(paper_doc)
-
-    return PaperOut(
-        id=str(result.inserted_id),
-        arxiv_id=body.arxiv_id,
-        title=body.title,
-        url=body.url,
-        summary=body.summary,
-        authors=body.authors,
-        published=body.published,
+    prompt = (
+        f"Given this research paper:\n"
+        f"Title: \"{title}\"\n"
+        f"Summary: \"{summary_excerpt}\"\n\n"
+        f"Find {max_results} similar or closely related research papers "
+        f"that are available on arXiv. For each paper, provide the arXiv "
+        f"paper ID (the numeric identifier like 2301.12345) and the paper title.\n\n"
+        f"Format each result on its own line exactly as:\n"
+        f"ARXIV_ID: <id> | TITLE: <title>"
     )
 
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(tools=[grounding_tool])
 
-@router.get("/my", response_model=list[PaperOut])
-async def get_my_papers(current_user: dict = Depends(get_current_user)):
-    """Return all papers saved by the current user."""
-    db = get_db()
-    user_id = str(current_user["_id"])
-    cursor = db.papers.find({"user_id": user_id}).sort("saved_at", -1)
-    papers = []
-    async for doc in cursor:
-        papers.append(
-            PaperOut(
-                id=str(doc["_id"]),
-                arxiv_id=doc["arxiv_id"],
-                title=doc["title"],
-                url=doc["url"],
-                summary=doc["summary"],
-                authors=doc.get("authors", []),
-                published=doc.get("published", ""),
-            )
+    try:
+        response = genai_client.models.generate_content(
+            model=GROUNDING_MODEL,
+            contents=prompt,
+            config=config,
         )
-    return papers
+    except Exception as exc:
+        logger.warning("Google Search grounding request failed: %s", exc)
+        return []
 
+    text = response.text or ""
+    results: list[dict] = []
+    seen_ids: set[str] = set()
 
-@router.get("/similar/{paper_id}", response_model=list[PaperOut])
-async def find_similar_papers(paper_id: str, limit: int = 10, current_user: dict = Depends(get_current_user)):
-    """
-    Find papers with similar summaries using MongoDB Atlas Vector Search.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
 
-    PREREQUISITE: You must create a Vector Search index in MongoDB Atlas:
-      - Index name: "vector_index"
-      - Collection: "papers"
-      - Field mapping:
-        {
-          "type": "vectorSearch",
-          "fields": [{
-            "type": "vector",
-            "path": "embedding",
-            "numDimensions": 1536,
-            "similarity": "cosine"
-          }]
-        }
-    """
-    db = get_db()
-    user_id = str(current_user["_id"])
+        # Try structured format first: ARXIV_ID: ... | TITLE: ...
+        if "ARXIV_ID:" in line and "TITLE:" in line:
+            parts = line.split("|", maxsplit=1)
+            arxiv_part = parts[0].split("ARXIV_ID:")[-1].strip()
+            title_part = parts[1].split("TITLE:")[-1].strip() if len(parts) > 1 else ""
 
-    # Get the source paper
-    source = await db.papers.find_one({"_id": ObjectId(paper_id), "user_id": user_id})
-    if not source:
-        raise HTTPException(status_code=404, detail="Paper not found")
+            # Extract the numeric arXiv ID from the part
+            id_match = _ARXIV_ID_RE.search(arxiv_part)
+            if id_match and id_match.group(1) not in seen_ids:
+                aid = id_match.group(1)
+                seen_ids.add(aid)
+                results.append({"arxiv_id": aid, "title": title_part or aid})
+                continue
 
-    query_embedding = source.get("embedding")
-    if not query_embedding:
-        raise HTTPException(status_code=400, detail="Paper has no embedding")
+        # Fallback: extract any arXiv ID from the line
+        for m in _ARXIV_ID_RE.finditer(line):
+            aid = m.group(1)
+            if aid not in seen_ids:
+                seen_ids.add(aid)
+                results.append({"arxiv_id": aid, "title": line})
 
-    # Atlas Vector Search aggregation pipeline
-    pipeline = [
-        {
-            "$vectorSearch": {
-                "index": "vector_index",
-                "path": "embedding",
-                "queryVector": query_embedding,
-                "numCandidates": limit * 10,
-                "limit": limit + 1,  # +1 to account for the source paper
-                "filter": {"user_id": user_id},
-            }
-        },
-        {
-            "$addFields": {
-                "score": {"$meta": "vectorSearchScore"},
-            }
-        },
-        {
-            "$match": {
-                "_id": {"$ne": ObjectId(paper_id)},  # Exclude the source paper
-            }
-        },
-        {"$limit": limit},
-    ]
-
-    results = []
-    async for doc in db.papers.aggregate(pipeline):
-        results.append(
-            PaperOut(
-                id=str(doc["_id"]),
-                arxiv_id=doc["arxiv_id"],
-                title=doc["title"],
-                url=doc["url"],
-                summary=doc["summary"],
-                authors=doc.get("authors", []),
-                published=doc.get("published", ""),
-                similarity_score=doc.get("score"),
-            )
-        )
+    logger.info("Google Search grounding found %d related papers", len(results))
     return results
-
-
-@router.delete("/{paper_id}")
-async def delete_paper(paper_id: str, current_user: dict = Depends(get_current_user)):
-    """Delete a saved paper."""
-    db = get_db()
-    user_id = str(current_user["_id"])
-    result = await db.papers.delete_one({"_id": ObjectId(paper_id), "user_id": user_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Paper not found")
-    return {"detail": "Paper deleted"}
