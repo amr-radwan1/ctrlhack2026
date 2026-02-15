@@ -295,6 +295,9 @@ export default function Home() {
       .join("line")
       .attr("stroke-width", 2);
 
+    // ── Determine root node ID first ──
+    const rootId = rootNodeId ?? graphState.nodes.find((n) => n.is_root)?.id ?? simulationNodes[0]?.id;
+
     const nodeSelection = zoomContainer
       .append("g")
       .selectAll("g")
@@ -304,27 +307,41 @@ export default function Home() {
 
     nodeSelection
       .append("circle")
-      .attr("r", (node: ApiGraphNode) => (node.id === selectedNodeId ? 32 : 26))
+      .attr("class", "node-circle")
+      .attr("r", 26)
       .attr("fill", (node: ApiGraphNode) => {
-        if (node.id === selectedNodeId) {
+        if (node.id === rootId) {
           return "#ec4899";
         }
         return hasOutgoingLinks(node.id) ? "#a855f7" : "#404040";
       })
-      .attr("stroke", (node: ApiGraphNode) =>
-        node.id === selectedNodeId ? "#f472b6" : "#525252",
-      )
-      .attr("stroke-width", (node: ApiGraphNode) =>
-        node.id === selectedNodeId ? 3 : 2,
-      )
+      .attr("stroke", "#525252")
+      .attr("stroke-width", 2)
       .style("filter", (node: ApiGraphNode) => {
-        if (node.id === selectedNodeId) {
+        if (node.id === rootId) {
           return "drop-shadow(0 0 12px rgba(236, 72, 153, 0.6))";
         }
         return hasOutgoingLinks(node.id)
           ? "drop-shadow(0 0 8px rgba(168, 85, 247, 0.5))"
           : "none";
       });
+
+    // Selection highlight ring (rendered on top of the fill circle)
+    nodeSelection
+      .append("circle")
+      .attr("class", "selection-ring")
+      .attr("r", 30)
+      .attr("fill", "none")
+      .attr("stroke", (node: ApiGraphNode) =>
+        node.id === selectedNodeId ? "#f472b6" : "none",
+      )
+      .attr("stroke-width", 3)
+      .attr("stroke-opacity", 0.9)
+      .style("filter", (node: ApiGraphNode) =>
+        node.id === selectedNodeId
+          ? "drop-shadow(0 0 8px rgba(244, 114, 182, 0.7))"
+          : "none",
+      );
 
     nodeSelection
       .append("text")
@@ -372,7 +389,6 @@ export default function Home() {
     const maxRadius = Math.min(viewport.width, viewport.height) * 0.4;
 
     // Build a map: nodeId → best (max) similarity to the root
-    const rootId = rootNodeId ?? graphState.nodes.find((n) => n.is_root)?.id ?? simulationNodes[0]?.id;
     const bestSimilarity = new Map<string, number>();
     for (const link of graphState.links) {
       const s = toNodeId(link.source);
@@ -403,11 +419,19 @@ export default function Home() {
     }
 
     // Compute target radius for each node: high similarity → small radius
+    // Normalize similarities to spread nodes across the full radius range
+    const allSims = Array.from(bestSimilarity.values());
+    const minSim = allSims.length > 0 ? Math.min(...allSims) : 0;
+    const maxSim = allSims.length > 0 ? Math.max(...allSims) : 1;
+    const simRange = maxSim - minSim || 1;
+
     const nodeRadius = (node: any): number => {
       if (node.id === rootId) return 0;
       const sim = bestSimilarity.get(node.id) ?? 0;
-      // sim 1.0 → 15% of maxRadius, sim 0.0 → 100% of maxRadius
-      return maxRadius * (1 - sim * 0.85);
+      // Normalize to [0, 1] then invert: highest similarity → closest
+      const normalized = (sim - minSim) / simRange;
+      // normalized 1.0 → 15% of maxRadius, normalized 0.0 → 100%
+      return maxRadius * (1 - normalized * 0.85);
     };
 
     const simulation = d3
@@ -419,18 +443,19 @@ export default function Home() {
           .id((node: ApiGraphNode) => node.id)
           .distance((link: any) => {
             const sim = link.similarity ?? 0;
-            return maxRadius * (1 - sim * 0.85);
+            const normalized = (sim - minSim) / simRange;
+            return maxRadius * (1 - normalized * 0.85);
           })
           .strength(0.3),
       )
-      .force("charge", d3.forceManyBody().strength(-400))
+      .force("charge", d3.forceManyBody().strength(-300))
       .force(
         "radial",
         d3.forceRadial(
           (node: any) => nodeRadius(node),
           cx,
           cy,
-        ).strength((node: any) => (node.id === rootId ? 1 : 0.8)),
+        ).strength((node: any) => (node.id === rootId ? 1 : 1.2)),
       )
       .force("collision", d3.forceCollide().radius(42));
 
@@ -590,31 +615,18 @@ export default function Home() {
         if (!isFocusActive) return 1;
         return isConnected(node.id) ? 1 : 0.1;
       })
-      .select("circle")
+      .select("circle.selection-ring")
       .transition()
-      .duration(300) // Match opacity duration
+      .duration(300)
       .ease(d3.easeQuadOut)
-      .attr("r", (node: ApiGraphNode) => (node.id === selectedNodeId ? 32 : 26))
-      .attr("fill", (node: ApiGraphNode) => {
-        if (node.id === selectedNodeId) {
-          return "#ec4899";
-        }
-        return hasOutgoingLinks(node.id) ? "#a855f7" : "#404040";
-      })
       .attr("stroke", (node: ApiGraphNode) =>
-        node.id === selectedNodeId ? "#f472b6" : "#525252"
+        node.id === selectedNodeId ? "#f472b6" : "none"
       )
-      .attr("stroke-width", (node: ApiGraphNode) =>
-        node.id === selectedNodeId ? 3 : 2
-      )
-      .style("filter", (node: ApiGraphNode) => {
-        if (node.id === selectedNodeId) {
-          return "drop-shadow(0 0 12px rgba(236, 72, 153, 0.6))";
-        }
-        return hasOutgoingLinks(node.id)
-          ? "drop-shadow(0 0 8px rgba(168, 85, 247, 0.5))"
-          : "none";
-      });
+      .style("filter", (node: ApiGraphNode) =>
+        node.id === selectedNodeId
+          ? "drop-shadow(0 0 8px rgba(244, 114, 182, 0.7))"
+          : "none"
+      );
 
     // Update links: highlight edges connected to selected or focused node
     svg.selectAll("g.zoom-container line")
